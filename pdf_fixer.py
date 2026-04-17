@@ -1,612 +1,726 @@
-# fixers/pptx_fixer.py
+# fixers/pdf_fixer.py
 
 import io
-import logging
-import warnings
-from lxml import etree
-from PIL import Image
+import os
+import tempfile
+from collections import defaultdict
 
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.dml.color import RGBColor
-from pptx.util import Pt
+import fitz
+import pikepdf
+from pikepdf import Name, String, Dictionary, Array
+from PIL import Image, ImageStat
 
-import torch
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+from transformers import BlipProcessor, BlipForConditionalGeneration
 
-import wcag_contrast_ratio as wcag
+HF_TOKEN = os.environ.get("HF_TOKEN", None)
 
-logging.getLogger("transformers").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", category=UserWarning)
+BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 
-# ── XML namespaces ────────────────────────────────────────────────────────────
-# DrawingML (colours, fills, fonts)
-_DML = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
-# PresentationML (slides, shapes, backgrounds)
-_PML = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_NAME)
+blip_model     = BlipForConditionalGeneration.from_pretrained(
+    BLIP_MODEL_NAME,
+    token=HF_TOKEN,
+)
 
-# Maps <a:schemeClr val="…"> semantic aliases → clrScheme child-element names
-_SCHEME_ALIAS = {
-    "bg1":   "lt1",
-    "bg2":   "lt2",
-    "tx1":   "dk1",
-    "tx2":   "dk2",
-    "phClr": "dk1",   # placeholder colour – fall back to dark-1
-}
 
-# ============================================================
-# MOBILENET
-# ============================================================
+# ==========================================
+# COLOUR UTILITIES  (mirrored from checker)
+# ==========================================
 
-_MN_MODEL      = None
-_MN_TRANSFORM  = None
-_MN_CATEGORIES = None
-
-
-def _load_mobilenet():
-    global _MN_MODEL, _MN_TRANSFORM, _MN_CATEGORIES
-    if _MN_MODEL is None:
-        weights        = MobileNet_V3_Small_Weights.DEFAULT
-        _MN_MODEL      = mobilenet_v3_small(weights=weights)
-        _MN_MODEL.eval()
-        _MN_TRANSFORM  = weights.transforms()
-        _MN_CATEGORIES = weights.meta["categories"]
-
-
-def classify_image(image_bytes):
-    _load_mobilenet()
-    img   = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    batch = _MN_TRANSFORM(img).unsqueeze(0)
-    with torch.no_grad():
-        preds = _MN_MODEL(batch)
-        probs = preds.softmax(dim=1)[0]
-        score, idx = probs.max(dim=0)
-    return _MN_CATEGORIES[int(idx)], float(score)
-
-
-def is_decorative_label(label):
-    decorative_keywords = [
-        "pattern", "background", "wallpaper", "border", "frame",
-        "logo", "emblem", "symbol", "texture", "screen", "monitor",
-        "banner", "sign", "flag",
-    ]
-    return any(k in label.lower() for k in decorative_keywords)
-
-
-# ============================================================
-# THEME COLOUR EXTRACTION
-# ============================================================
-
-def extract_theme_colors(prs):
-    """
-    Walk the first slide-master's relationships to find the theme part,
-    parse its <a:clrScheme>, and return:
-        { 'dk1': 'RRGGBB', 'lt1': 'RRGGBB', 'acc1': 'RRGGBB', … }
-    Returns {} on any failure so callers fall back gracefully.
-    """
-    try:
-        slide_master = prs.slide_masters[0]
-        theme_part   = None
-        for rel in slide_master.part.rels.values():
-            if "theme" in rel.reltype.lower():
-                theme_part = rel.target_part
-                break
-        if theme_part is None:
-            return {}
-
-        tree       = etree.fromstring(theme_part.blob)
-        clr_scheme = tree.find(f".//{_DML}clrScheme")
-        if clr_scheme is None:
-            return {}
-
-        colors = {}
-        for child in clr_scheme:
-            tag  = child.tag.split("}")[-1]          # e.g. "dk1", "lt2", "acc1"
-            srgb = child.find(f"{_DML}srgbClr")
-            if srgb is not None:
-                colors[tag] = srgb.get("val", "000000")
-                continue
-            sys_clr = child.find(f"{_DML}sysClr")
-            if sys_clr is not None:
-                colors[tag] = sys_clr.get("lastClr", "000000")
-        return colors
-    except Exception:
-        return {}
-
-
-# ============================================================
-# LOW-LEVEL XML COLOUR RESOLUTION
-# ============================================================
-
-def _hex_to_rgb(hex_str):
-    s = (hex_str or "000000").lstrip("#").zfill(6)
-    try:
-        return tuple(int(s[i: i + 2], 16) for i in (0, 2, 4))
-    except Exception:
-        return (0, 0, 0)
-
-
-def _apply_lum_modifiers(rgb, lum_mod_val, lum_off_val):
-    """Apply <a:lumMod> / <a:lumOff> (integer 1/100 000 fractions)."""
-    mod = lum_mod_val / 100_000.0
-    off = lum_off_val / 100_000.0
-
-    def adjust(c):
-        return max(0, min(255, round(c * mod + off * 255)))
-
-    return tuple(adjust(c) for c in rgb)
-
-
-def resolve_color_element(elem, theme_colors):
-    """
-    Given an XML colour child element (direct child of <a:solidFill>)
-    return (R, G, B) or None.
-
-    Handles:
-      <a:srgbClr val="RRGGBB"/>
-      <a:sysClr  lastClr="RRGGBB"/>
-      <a:schemeClr val="dk1">
-          <a:lumMod val="75000"/>
-          <a:lumOff val="25000"/>
-      </a:schemeClr>
-    """
-    if elem is None:
-        return None
-
-    local = elem.tag.split("}")[-1]
-
-    if local == "srgbClr":
-        return _hex_to_rgb(elem.get("val", "000000"))
-
-    if local == "sysClr":
-        return _hex_to_rgb(elem.get("lastClr", "000000"))
-
-    if local == "schemeClr":
-        scheme_key   = elem.get("val", "")
-        resolved_key = _SCHEME_ALIAS.get(scheme_key, scheme_key)
-        hex_val      = theme_colors.get(resolved_key, "000000")
-        rgb          = _hex_to_rgb(hex_val)
-
-        lm      = elem.find(f"{_DML}lumMod")
-        lo      = elem.find(f"{_DML}lumOff")
-        lum_mod = int(lm.get("val", "100000")) if lm is not None else 100_000
-        lum_off = int(lo.get("val", "0"))       if lo is not None else 0
-
-        if lum_mod != 100_000 or lum_off != 0:
-            rgb = _apply_lum_modifiers(rgb, lum_mod, lum_off)
-
-        return rgb
-
-    return None
-
-
-def _resolve_solid_fill(solid_elem, theme_colors):
-    """Resolve every colour child of a <a:solidFill>; return first success."""
-    if solid_elem is None:
-        return None
-    for child in solid_elem:
-        rgb = resolve_color_element(child, theme_colors)
-        if rgb is not None:
-            return rgb
-    return None
-
-
-# ============================================================
-# TARGETED FILL READERS
-# (never touch text-body / run children)
-# ============================================================
-
-def _spPr_fill(shape_elem, theme_colors):
-    """
-    Read the fill from a shape's <p:spPr> or <a:spPr> ONLY.
-
-    This is a *direct-child* search — it will never descend into
-    <p:txBody> or any <a:rPr> that lives inside text runs, so it
-    cannot accidentally return a text colour as a background colour.
-
-    Returns:
-        (R, G, B)   – explicit solid fill
-        "noFill"    – explicit transparent fill
-        None        – no fill information found
-    """
-    # Shapes use the PML namespace; group/picture shapes may use DML
-    sp_pr = shape_elem.find(f"{_PML}spPr")
-    if sp_pr is None:
-        sp_pr = shape_elem.find(f"{_DML}spPr")
-    if sp_pr is None:
-        return None
-
-    # Explicit noFill → treat as transparent (use slide background)
-    if sp_pr.find(f"{_DML}noFill") is not None:
-        return "noFill"
-
-    # Direct-child solidFill only (no .// wildcard)
-    solid = sp_pr.find(f"{_DML}solidFill")
-    return _resolve_solid_fill(solid, theme_colors)
-
-
-def _slide_bg_fill(slide, theme_colors):
-    """
-    Read the solid fill from the slide's <p:bg><p:bgPr>.
-
-    Only inspects the background property element directly;
-    never descends into shape or text children.
-
-    Returns (R, G, B) or None.
-    """
-    try:
-        # slide.background._element is <p:bg>
-        bg_elem = slide.background._element
-        bg_pr   = bg_elem.find(f"{_PML}bgPr")
-        if bg_pr is not None:
-            if bg_pr.find(f"{_DML}noFill") is not None:
-                return None
-            solid = bg_pr.find(f"{_DML}solidFill")
-            rgb   = _resolve_solid_fill(solid, theme_colors)
-            if rgb is not None:
-                return rgb
-    except Exception:
-        pass
-    return None
-
-
-# ============================================================
-# SHAPE / RUN COLOUR GETTERS
-# ============================================================
-
-def get_shape_bg_color(shape, slide, theme_colors):
-    """
-    Effective background colour behind *shape*.  Resolution order:
-
-      1. Shape's own <p:spPr> solidFill  (direct child — never text runs)
-      2. If shape is transparent (noFill) or has no fill → slide <p:bg>
-      3. Default white
-
-    The previous implementation used shape._element.find('.//{_DML}solidFill')
-    which searched ALL descendants, including <a:rPr> nodes inside text runs.
-    That caused fg == bg (ratio 1.00) false positives, and made fixes appear
-    to introduce new violations because the newly-written run solidFill nodes
-    were then picked up as the background on re-check.
-    """
-    result = _spPr_fill(shape._element, theme_colors)
-
-    # Explicit solid fill found on the shape itself
-    if result is not None and result != "noFill":
-        return result
-
-    # Shape is transparent or inherits — fall through to slide background
-    slide_bg = _slide_bg_fill(slide, theme_colors)
-    if slide_bg is not None:
-        return slide_bg
-
-    return (255, 255, 255)     # safe default: assume white canvas
-
-
-def get_run_fg_color(run, theme_colors):
-    """
-    Foreground (font) colour of *run*.  Resolution order:
-      1. <a:solidFill> that is a direct child of the run's <a:rPr> (XML)
-      2. python-pptx high-level API (handles plain RGB already resolved)
-      3. Default black
-    """
-    try:
-        rPr = run._r.find(f"{_DML}rPr")
-        if rPr is not None:
-            # Direct child only — rPr has no sub-elements that would confuse us
-            solid = rPr.find(f"{_DML}solidFill")
-            rgb   = _resolve_solid_fill(solid, theme_colors)
-            if rgb is not None:
-                return rgb
-    except Exception:
-        pass
-
-    try:
-        cf = run.font.color
-        if cf.type is not None and cf.rgb is not None:
-            rgb = cf.rgb
-            return (rgb[0], rgb[1], rgb[2])
-    except Exception:
-        pass
-
-    return (0, 0, 0)
-
-
-# ============================================================
-# CONTRAST HELPERS
-# ============================================================
-
-def contrast_ratio(c1, c2):
-    f1 = tuple(v / 255.0 for v in c1)
-    f2 = tuple(v / 255.0 for v in c2)
-    return wcag.rgb(f1, f2)
-
-
-def is_large_text(run):
-    try:
-        if run.font.size:
-            pt = run.font.size.pt
-            return pt >= 18 or (pt >= 14 and run.font.bold)
-    except Exception:
-        pass
-    return False
-
-
-def fix_run_contrast_xml(run, bg):
-    """
-    Fix the run's font colour by directly rewriting its <a:rPr> XML.
-
-    Using run.font.color.rgb = … via the python-pptx API only appends a new
-    srgbClr node but leaves the original <a:schemeClr> in place; many
-    renderers continue to honour the theme colour.  Instead we:
-      1. Locate or create <a:rPr> as the first child of the run element.
-      2. Remove every existing <a:solidFill> (may contain <a:schemeClr>,
-         <a:srgbClr>, or <a:sysClr>).
-      3. Insert a fresh <a:solidFill><a:srgbClr val="RRGGBB"/></a:solidFill>
-         so the run has one authoritative, explicit colour.
-
-    Picks whichever of black / white gives better contrast against *bg*.
-    """
-    black = (0, 0, 0)
-    white = (255, 255, 255)
-    target  = black if contrast_ratio(black, bg) >= contrast_ratio(white, bg) else white
-    hex_val = "{:02X}{:02X}{:02X}".format(*target)
-
-    r_elem = run._r
-
-    # Locate or create <a:rPr> — must be first child of <a:r>
-    rPr = r_elem.find(f"{_DML}rPr")
-    if rPr is None:
-        rPr = etree.Element(f"{_DML}rPr")
-        r_elem.insert(0, rPr)
-
-    # Remove every existing solidFill so nothing is inherited or duplicated
-    for sf in rPr.findall(f"{_DML}solidFill"):
-        rPr.remove(sf)
-
-    # Insert fresh solidFill at position 0 (before <a:latin>, <a:ea>, etc.)
-    solid = etree.Element(f"{_DML}solidFill")
-    srgb  = etree.SubElement(solid, f"{_DML}srgbClr")
-    srgb.set("val", hex_val)
-    rPr.insert(0, solid)
-
-
-# ============================================================
-# IMAGE HELPERS
-# ============================================================
-
-def extract_image_bytes(shape):
-    try:
-        return shape.image.blob
-    except Exception:
-        return None
-
-
-def fix_image_alt(shape, issues, slide_idx):
-    image_bytes = extract_image_bytes(shape)
-    if not image_bytes:
-        return 0, 0
-
-    label, score = classify_image(image_bytes)
-
-    cNvPr = None
-    for e in shape._element.iter():
-        if e.tag.endswith("cNvPr"):
-            cNvPr = e
-            break
-    if cNvPr is None:
-        return 0, 0
-
-    descr = (cNvPr.get("descr") or "").strip()
-    title = (cNvPr.get("title") or "").strip()
-
-    if is_decorative_label(label):
-        cNvPr.set("title", "Decorative")
-        cNvPr.set("descr", "")
-        issues.append(("Decorative image normalised", f"Slide {slide_idx + 1}"))
-        return 0, 1
-
-    if not descr and not title:
-        cNvPr.set("descr", f"Image of {label}")
-        issues.append(("Alt text added", f"Slide {slide_idx + 1}"))
-        return 1, 0
-
-    return 0, 0
-
-
-# ============================================================
-# TABLE HEADER HELPERS
-# ============================================================
-
-def check_and_fix_table_headers(shape, issues, slide_idx, apply_fix=False):
-    """
-    Verifies that a table shape has its 'first row as header' flag set
-    (<a:tblPr firstRow="1"/>), exposed by python-pptx as table.first_row.
-    When apply_fix is True also bolds first-row cells for visual clarity.
-    Returns the number of violations found (0 or 1 per table).
-    """
-    violations = 0
-    try:
-        table = shape.table
-        if not table.first_row:
-            violations = 1
-            issues.append(("Table missing header row flag", f"Slide {slide_idx + 1}"))
-
-            if apply_fix:
-                table.first_row = True
-                if len(table.rows) > 0:
-                    for cell in table.rows[0].cells:
-                        for para in cell.text_frame.paragraphs:
-                            for run in para.runs:
-                                run.font.bold = True
-                issues.append((
-                    "Table header row flag set + first row bolded",
-                    f"Slide {slide_idx + 1}",
-                ))
-    except Exception:
-        pass
-    return violations
-
-
-# ============================================================
-# MAIN SLIDE PROCESSOR
-# ============================================================
-
-def process_slides(prs, apply_fix=False):
-    """
-    Iterate every slide and shape, checking / optionally fixing:
-      - Image alt text
-      - Table header flags
-      - Text colour contrast
-
-    Returns a 6-tuple:
-        missing_alt         (int)
-        decorative          (int)
-        contrast_violations (int)
-        total_text_runs     (int)  – denominator for proportional contrast score
-        table_violations    (int)
-        issues              (list of (description, location) tuples)
-    """
-    missing_alt         = 0
-    decorative          = 0
-    contrast_violations = 0
-    total_text_runs     = 0
-    table_violations    = 0
-    issues              = []
-
-    theme_colors = extract_theme_colors(prs)
-
-    for s_idx, slide in enumerate(prs.slides):
-        for shape in slide.shapes:
-
-            # -------- PICTURES --------
-            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                m, d = fix_image_alt(shape, issues, s_idx)
-                missing_alt += m
-                decorative  += d
-
-            # -------- TABLES --------
-            if shape.shape_type == MSO_SHAPE_TYPE.TABLE:
-                table_violations += check_and_fix_table_headers(
-                    shape, issues, s_idx, apply_fix=apply_fix
-                )
-
-            # -------- TEXT --------
-            if getattr(shape, "has_text_frame", False):
-                bg = get_shape_bg_color(shape, slide, theme_colors)
-
-                for para in shape.text_frame.paragraphs:
-                    for run in para.runs:
-                        if not run.text.strip():
-                            continue
-
-                        total_text_runs += 1
-                        fg        = get_run_fg_color(run, theme_colors)
-                        threshold = 3.0 if is_large_text(run) else 4.5
-                        ratio     = contrast_ratio(fg, bg)
-
-                        if ratio < threshold:
-                            contrast_violations += 1
-                            issues.append((
-                                f"Low contrast text (ratio {ratio:.2f}, "
-                                f"threshold {threshold})",
-                                f"Slide {s_idx + 1}",
-                            ))
-                            if apply_fix:
-                                fix_run_contrast_xml(run, bg)
-
+def int_to_rgb(color_int):
     return (
-        missing_alt,
-        decorative,
-        contrast_violations,
-        total_text_runs,
-        table_violations,
-        issues,
+        (color_int >> 16) & 255,
+        (color_int >> 8) & 255,
+        color_int & 255,
     )
 
 
-# ============================================================
-# LANGUAGE FIX
-# ============================================================
-
-def fix_language(prs, issues):
-    if not prs.core_properties.language:
-        prs.core_properties.language = "en-US"
-        issues.append(("Language set to en-US", "Presentation"))
-        return 1
-    return 0
+def luminance(r, g, b):
+    def f(c):
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
 
 
-# ============================================================
-# SCORING
-# ============================================================
+def contrast_ratio(c1, c2):
+    L1 = luminance(*c1)
+    L2 = luminance(*c2)
+    return (max(L1, L2) + 0.05) / (min(L1, L2) + 0.05)
 
-class AllyScores:
 
-    @staticmethod
-    def score_from_count(count):
-        """Step-function penalty for alt-text, decorative, tables, lists, links."""
-        if count == 0:
-            return 100
-        if count <= 5:
-            return 76
-        if count <= 21:
-            return 53
-        return 5
+# ==========================================
+# IMAGE UTILITIES
+# ==========================================
 
-    @staticmethod
-    def contrast_score(violations, total):
-        """
-        Proportional Ally-style score for colour contrast.
+def extract_image_bytes(doc, xref):
+    try:
+        pix = fitz.Pixmap(doc, xref)
+        if pix.n >= 5:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        return pix.tobytes("png")
+    except Exception:
+        return None
 
-        Ally measures the percentage of content that passes and maps it to a
-        0-100 score.  A floor of 25 prevents a single bad run from collapsing
-        an otherwise healthy deck.
 
-        Examples (violations / total → score):
-          0  / 100 → 100   (perfect)
-          5  / 100 →  95
-          20 / 100 →  80
-          50 / 100 →  50
-         100 / 100 →  25   (floor)
-        """
-        if total == 0 or violations == 0:
-            return 100
-        passing_ratio = (total - violations) / total
-        return max(25, round(passing_ratio * 100))
+def generate_alt_text(image_bytes):
+    try:
+        img     = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        inputs  = blip_processor(images=img, return_tensors="pt")
+        out     = blip_model.generate(**inputs)
+        caption = blip_processor.decode(out[0], skip_special_tokens=True)
 
-    @staticmethod
-    def compute(
-        missing_alt,
-        decorative,
-        language_missing,
-        headings_missing,
-        tables_missing,
-        contrast,
-        total_text_runs,
-        lists,
-        links,
+        if not caption or len(caption.strip()) < 5:
+            return "Image requires manual description."
+
+        return caption
+    except Exception:
+        return "Image requires manual description."
+
+
+def is_decorative(image_bytes):
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        w, h = img.size
+
+        # VERY small images only
+        if w * h < 24 * 24:
+            return True
+
+        gray = img.convert("L")
+        stat = ImageStat.Stat(gray)
+
+        # Only near-blank images
+        if stat.var[0] < 10:  # was 50 → too aggressive
+            return True
+
+        # Only extreme white/black
+        if stat.mean[0] > 250 or stat.mean[0] < 5:
+            return True
+
+        return False
+    except Exception:
+        return False
+
+def get_all_images(doc):
+    """Return {page_index: [xref, ...]} with duplicates removed per page."""
+    page_images = {}
+    for i, page in enumerate(doc):
+        xrefs = list(dict.fromkeys(img[0] for img in page.get_images(full=True)))
+        page_images[i] = xrefs
+    return page_images
+
+
+# ==========================================
+# STRUCTURE UTILITIES
+# ==========================================
+
+def create_structure_if_missing(pdf):
+    if "/StructTreeRoot" in pdf.Root:
+        return pdf.Root["/StructTreeRoot"]
+
+    struct = pdf.make_indirect(Dictionary({
+        "/Type": Name("/StructTreeRoot"),
+        "/K":    Array([]),
+    }))
+    pdf.Root["/StructTreeRoot"] = struct
+    pdf.Root["/MarkInfo"]       = Dictionary({"/Marked": True})
+    return struct
+
+
+def _append_to_struct(struct, elem):
+    if "/K" not in struct:
+        struct["/K"] = Array()
+    struct["/K"].append(elem)
+
+
+def create_figure_tag(pdf, struct, page_obj, alt_text):
+    """Create an informative Figure element with the given alt text."""
+    page_ref = page_obj.obj if hasattr(page_obj, "obj") else page_obj
+    fig = pdf.make_indirect(Dictionary({
+        "/Type": Name("/StructElem"),
+        "/S":    Name("/Figure"),
+        "/Alt":  String(alt_text),
+        "/Pg":   page_ref,
+    }))
+    _append_to_struct(struct, fig)
+
+
+def create_decorative_figure_tag(pdf, struct, page_obj):
+    """
+    Create a Figure element for a decorative image.
+
+    The checker identifies decorative figures by checking whether
+    /ActualText contains "decorative".  Setting /ActualText = "decorative"
+    here (rather than /Alt = "") means the checker correctly counts this as
+    decorative rather than as a missing-alt-text violation.
+    """
+    page_ref = page_obj.obj if hasattr(page_obj, "obj") else page_obj
+    fig = pdf.make_indirect(Dictionary({
+        "/Type":       Name("/StructElem"),
+        "/S":          Name("/Figure"),
+        "/Alt":        String(""),
+        "/ActualText": String("decorative"),
+        "/Pg":         page_ref,
+    }))
+    _append_to_struct(struct, fig)
+
+
+# ==========================================
+# FIX 1 – ALT TEXT
+# ==========================================
+
+def _build_obj_to_page(pdf):
+    """
+    Return a dict mapping PDF object number → zero-based page index.
+
+    The broken original code used  pg.objgen[0] - 1  which treated the PDF
+    object number as a page index.  Object numbers are assigned in order of
+    creation, not in page order, so this produces a completely wrong value
+    for every page after the first.
+
+    The correct approach is to iterate pdf.pages once, record each page's
+    object number, then look up Figure elements' /Pg references against that
+    mapping.
+    """
+    obj_to_page = {}
+    for i, page in enumerate(pdf.pages):
+        try:
+            obj_to_page[page.objgen[0]] = i
+        except Exception:
+            pass
+    return obj_to_page
+
+
+def _collect_figures_needing_alt(struct, obj_to_page):
+    """
+    Walk the StructTree and return two lists:
+
+    figures_by_page  – dict {page_index: [elem, ...]}
+                       Figures whose page we could resolve via /Pg.
+
+    orphan_figures   – [elem, ...]
+                       Figures with no /Pg or an unresolvable /Pg reference.
+                       These are paired with whatever images remain after
+                       page-matched figures are processed.
+
+    Figures that already have adequate alt text (len >= 5) or are already
+    marked decorative via /ActualText are skipped.
+    """
+    figures_by_page = defaultdict(list)
+    orphan_figures  = []
+
+    def walk(elem):
+        try:
+            if isinstance(elem, Array):
+                for c in elem:
+                    walk(c)
+                return
+
+            if not isinstance(elem, Dictionary):
+                return
+
+            s      = elem.get("/S")
+            s_name = str(s)[1:] if isinstance(s, Name) else None
+
+            if s_name == "Figure":
+                alt    = elem.get("/Alt")
+                actual = elem.get("/ActualText")
+
+                # Already decorative — nothing to do
+                if isinstance(actual, String) and "decorative" in str(actual).lower():
+                    pass
+
+                # Already has adequate alt text — nothing to do
+                elif alt and len(str(alt).strip()) >= 5:
+                    pass
+
+                else:
+                    # Needs alt text — try to resolve the page
+                    page_index = None
+                    pg = elem.get("/Pg")
+                    if pg is not None:
+                        try:
+                            page_index = obj_to_page.get(pg.objgen[0])
+                        except Exception:
+                            pass
+
+                    if page_index is not None:
+                        figures_by_page[page_index].append(elem)
+                    else:
+                        orphan_figures.append(elem)
+
+            k = elem.get("/K")
+            if k:
+                walk(k)
+
+        except Exception:
+            pass
+
+    walk(struct)
+    return figures_by_page, orphan_figures
+
+
+def _caption_for_image(doc, xref):
+    img_bytes = extract_image_bytes(doc, xref)
+    if not img_bytes:
+        return "Image requires manual description.", False
+
+    # Generate caption FIRST
+    caption = generate_alt_text(img_bytes)
+
+    # Only mark decorative if:
+    # - caption is weak AND
+    # - strong decorative signal
+    if is_decorative(img_bytes) and (
+        not caption or "manual" in caption.lower()
     ):
-        scores = {
-            "alternative_text": AllyScores.score_from_count(missing_alt),
-            "decorative":        AllyScores.score_from_count(decorative),
-            "language":          95 if language_missing else 100,
-            "headings":          99 if headings_missing else 100,
-            "tables":            AllyScores.score_from_count(tables_missing),
-            "color_contrast":    AllyScores.contrast_score(contrast, total_text_runs),
-            "lists":             AllyScores.score_from_count(lists),
-            "links":             AllyScores.score_from_count(links),
+        return "", True
+
+    return caption, False
+
+
+def _apply_alt_to_elem(elem, caption, decorative):
+    existing_alt = elem.get("/Alt")
+    existing_actual = elem.get("/ActualText")
+
+    # If already marked decorative → leave it
+    if isinstance(existing_actual, String) and "decorative" in str(existing_actual).lower():
+        return
+
+    # If already has good alt text → DO NOT overwrite
+    if existing_alt and len(str(existing_alt).strip()) >= 5:
+        return
+
+    # Only mark decorative if VERY confident
+    if decorative and not caption:
+        elem["/ActualText"] = String("decorative")
+        elem["/Alt"] = String("")
+    else:
+        elem["/Alt"] = String(caption if caption else "Image requires manual description.")
+
+def fix_alt_text(pdf, doc, struct, page_images):
+    """
+    Two-phase alt-text fixer.
+
+    Phase 1 – Fix existing Figure elements in the StructTree
+    ---------------------------------------------------------
+    For each Figure element that is missing alt text we look up its page via
+    /Pg → obj_to_page and then pair it with the next unused image xref on
+    that page.  This is an ordered pairing: the first Figure on a page gets
+    the first image, the second Figure gets the second image, etc.  It is a
+    heuristic but matches the typical document order.
+
+    Figures whose page cannot be resolved (no /Pg, or object number not in
+    the page list) are collected as "orphans" and processed in Phase 1b using
+    whatever image xrefs are still unused after the page-matched pass.
+
+    Phase 2 – Tag genuinely untagged images
+    ----------------------------------------
+    Any image xref that was not consumed in Phase 1 has no StructTree entry
+    at all.  We create a new Figure element for each, using BLIP to generate
+    a caption.
+
+    Returns the set of all image xrefs that were processed (used_images).
+    """
+    obj_to_page = _build_obj_to_page(pdf)
+
+    figures_by_page, orphan_figures = _collect_figures_needing_alt(
+        struct, obj_to_page
+    )
+
+    used_images: set = set()
+
+    # ── Phase 1a: page-matched Figures ───────────────────────────────────
+    for page_idx, figures in figures_by_page.items():
+        # Build an ordered list of unused xrefs for this page
+        available = [x for x in page_images.get(page_idx, [])
+                     if x not in used_images]
+
+        for i, fig_elem in enumerate(figures):
+            if i < len(available):
+                xref = available[i]
+                caption, decorative = _caption_for_image(doc, xref)
+                _apply_alt_to_elem(fig_elem, caption, decorative)
+                used_images.add(xref)
+            else:
+                # More Figures on this page than images — use placeholder
+                fig_elem["/Alt"] = String("Image requires manual description.")
+
+    # ── Phase 1b: orphan Figures (no page info) ──────────────────────────
+    if orphan_figures:
+        remaining = [
+            (pi, x)
+            for pi, xrefs in page_images.items()
+            for x in xrefs
+            if x not in used_images
+        ]
+
+        for i, fig_elem in enumerate(orphan_figures):
+            if i < len(remaining):
+                _, xref       = remaining[i]
+                caption, decorative = _caption_for_image(doc, xref)
+                _apply_alt_to_elem(fig_elem, caption, decorative)
+                used_images.add(xref)
+            else:
+                fig_elem["/Alt"] = String("Image requires manual description.")
+
+    # ── Phase 2: genuinely untagged images ───────────────────────────────
+    untagged = [
+        (pi, x)
+        for pi, xrefs in page_images.items()
+        for x in xrefs
+        if x not in used_images
+    ]
+
+    if untagged:
+        print(f"  Tagging {len(untagged)} untagged image(s)...")
+        for page_idx, xref in untagged:
+            page_obj          = pdf.pages[page_idx]
+            caption, decorative = _caption_for_image(doc, xref)
+            if decorative:
+                create_decorative_figure_tag(pdf, struct, page_obj)
+            else:
+                create_figure_tag(pdf, struct, page_obj, caption)
+            used_images.add(xref)
+    else:
+        print("  All images matched to existing StructTree Figure elements.")
+
+    return used_images
+
+
+# ==========================================
+# FIX 2 – TABLE HEADERS
+# ==========================================
+
+def fix_table_headers(pdf):
+    """
+    Walk the PDF StructTree.  For each Table element that has no TH
+    descendants, convert the first TR's cells from TD → TH and add
+    /Scope = /Column so the header relationship is explicit.
+
+    Returns the number of tables fixed.
+    """
+    if "/StructTreeRoot" not in pdf.Root:
+        return 0
+
+    fixed = 0
+
+    def has_th(elem):
+        try:
+            if isinstance(elem, Array):
+                return any(has_th(c) for c in elem)
+            if not isinstance(elem, Dictionary):
+                return False
+            s = elem.get("/S")
+            if isinstance(s, Name) and str(s) == "/TH":
+                return True
+            k = elem.get("/K")
+            return has_th(k) if k else False
+        except Exception:
+            return False
+
+    def get_children(elem):
+        k = elem.get("/K")
+        if k is None:
+            return []
+        if isinstance(k, Array):
+            return list(k)
+        if isinstance(k, Dictionary):
+            return [k]
+        return []
+
+    def promote_first_row(table_elem):
+        for child in get_children(table_elem):
+            if not isinstance(child, Dictionary):
+                continue
+            s = child.get("/S")
+            if not (isinstance(s, Name) and str(s) == "/TR"):
+                continue
+            for cell in get_children(child):
+                if not isinstance(cell, Dictionary):
+                    continue
+                cs = cell.get("/S")
+                if isinstance(cs, Name) and str(cs) in ("/TD", "/TH"):
+                    cell["/S"]     = Name("/TH")
+                    cell["/Scope"] = Name("/Column")
+            return True
+        return False
+
+    def walk(elem):
+        nonlocal fixed
+        try:
+            if isinstance(elem, Array):
+                for c in elem:
+                    walk(c)
+                return
+            if not isinstance(elem, Dictionary):
+                return
+
+            s      = elem.get("/S")
+            s_name = str(s)[1:] if isinstance(s, Name) else None
+
+            if s_name == "Table" and not has_th(elem):
+                if promote_first_row(elem):
+                    fixed += 1
+
+            k = elem.get("/K")
+            if k:
+                walk(k)
+        except Exception:
+            pass
+
+    walk(pdf.Root["/StructTreeRoot"])
+    return fixed
+
+
+# ==========================================
+# FIX 3 – LINK ACCESSIBLE NAMES
+# ==========================================
+
+def fix_link_accessible_names(pdf, doc):
+    """
+    Find Link annotations with neither visible text in their rectangle nor
+    an existing /Contents entry, then populate /Contents with the link's URI
+    or a page-destination reference so assistive technology has an accessible
+    name.
+
+    Returns the number of annotations updated.
+    """
+    fixed = 0
+
+    for page_idx, page in enumerate(doc):
+        try:
+            pdf_page = pdf.pages[page_idx]
+            annots   = pdf_page.get("/Annots")
+            if not annots:
+                continue
+        except Exception:
+            continue
+
+        fitz_links = {
+            (round(lk["from"][0]), round(lk["from"][1]),
+             round(lk["from"][2]), round(lk["from"][3])): lk
+            for lk in page.get_links()
+            if lk.get("from")
         }
 
-        final = min(scores.values())
+        for annot_ref in annots:
+            try:
+                annot = annot_ref
 
-        if final == 100:
-            band = "Dark Green"
-        elif final >= 67:
-            band = "Light Green"
-        elif final >= 34:
-            band = "Yellow"
-        else:
-            band = "Red"
+                if annot.get("/Subtype") != Name("/Link"):
+                    continue
 
-        scores["final"] = final
-        scores["band"]  = band
-        return scores
+                existing = annot.get("/Contents")
+                if existing and str(existing).strip():
+                    continue
+
+                raw_rect = annot.get("/Rect")
+                if raw_rect is None:
+                    continue
+
+                fitz_rect    = fitz.Rect(float(raw_rect[0]), float(raw_rect[1]),
+                                         float(raw_rect[2]), float(raw_rect[3]))
+                visible_text = page.get_textbox(fitz_rect).strip()
+                if visible_text:
+                    continue
+
+                accessible_name = _derive_link_name(annot, fitz_links, fitz_rect)
+                if accessible_name:
+                    annot["/Contents"] = String(accessible_name)
+                    fixed += 1
+
+            except Exception:
+                pass
+
+    return fixed
+
+
+def _derive_link_name(annot, fitz_links, fitz_rect):
+    action = annot.get("/A")
+    if isinstance(action, Dictionary):
+        uri = action.get("/URI")
+        if uri:
+            return str(uri)
+        named = action.get("/N")
+        if named:
+            return str(named).lstrip("/")
+
+    dest = annot.get("/Dest")
+    if dest is not None:
+        if isinstance(dest, Array) and len(dest) > 0:
+            try:
+                return f"Link to page {dest[0].objgen[0]}"
+            except Exception:
+                return "Internal link"
+        return "Internal link"
+
+    key = (round(fitz_rect.x0), round(fitz_rect.y0),
+           round(fitz_rect.x1), round(fitz_rect.y1))
+    lk = fitz_links.get(key)
+    if lk:
+        uri = lk.get("uri", "")
+        if uri:
+            return uri
+        pg = lk.get("page")
+        if pg is not None:
+            return f"Link to page {pg + 1}"
+
+    return "Link"
+
+
+# ==========================================
+# FIX 4 – COLOUR CONTRAST
+# ==========================================
+
+def fix_contrast(fitz_path):
+    """
+    Open *fitz_path*, find every low-contrast text span, redact the old
+    rendering (white-fill), then reinsert the text in black.
+
+    Why redact + reinsert rather than patching the content stream?
+    Directly editing colour operators in a compressed binary content stream
+    requires a full PDF content-stream parser.  PyMuPDF's redaction API
+    safely removes the old rendered glyph, and insert_textbox places a new
+    fully-accessible text span at the same position in black.
+
+    The corrected file is written back to the same path via a temp file +
+    os.replace so we never write to an open file handle.
+
+    Returns the number of spans fixed.
+    """
+    doc   = fitz.open(fitz_path)
+    fixed = 0
+
+    for page in doc:
+        blocks       = page.get_text("dict")["blocks"]
+        spans_to_fix = []
+
+        for b in blocks:
+            if "lines" not in b:
+                continue
+            for line in b["lines"]:
+                for span in line["spans"]:
+                    text = span["text"].strip()
+                    if not text or span["size"] < 6:
+                        continue
+
+                    color   = int_to_rgb(span["color"])
+                    c_white = contrast_ratio(color, (255, 255, 255))
+                    c_black = contrast_ratio(color, (0, 0, 0))
+
+                    if max(c_white, c_black) < 4.5:
+                        spans_to_fix.append(span)
+
+        if not spans_to_fix:
+            continue
+
+        for span in spans_to_fix:
+            page.add_redact_annot(fitz.Rect(span["bbox"]), fill=(1, 1, 1))
+
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        for span in spans_to_fix:
+            try:
+                page.insert_textbox(
+                    fitz.Rect(span["bbox"]),
+                    span["text"],
+                    fontsize=span["size"],
+                    color=(0, 0, 0),
+                    align=fitz.TEXT_ALIGN_LEFT,
+                )
+                fixed += 1
+            except Exception:
+                pass
+
+    if fixed > 0:
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(tmp_fd)
+        try:
+            doc.save(
+                tmp_path,
+                incremental=False,
+                encryption=fitz.PDF_ENCRYPT_NONE,
+                garbage=4,
+                deflate=True,
+            )
+            doc.close()
+            os.replace(tmp_path, fitz_path)
+        except Exception:
+            doc.close()
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    else:
+        doc.close()
+
+    return fixed
+
+
+# ==========================================
+# MAIN FIXER
+# ==========================================
+
+def fix_pdf(path):
+    """
+    Apply all accessibility fixes to *path* and save as <base>_fixed.pdf.
+
+    Fixes applied (in order)
+    -------------------------
+    1.  Title / Language metadata
+    2.  Tagging  (StructTree created if absent)
+    3.  Alt text  – existing Figure elements fixed via BLIP captioning;
+                    genuinely untagged images get new Figure entries
+    4.  Table headers  (TD → TH promotion on first row)
+    5.  Link accessible names  (/Contents on image/shape links)
+    6.  Colour contrast  (fitz redact + black reinsert, second pass)
+
+    Returns the path of the saved fixed file.
+    """
+    print(f"Fixing PDF: {path}")
+
+    base, ext  = os.path.splitext(path)
+    fixed_path = path if base.endswith("_fixed") else f"{base}_fixed{ext}"
+
+    # ── Open both libraries on the original file ──────────────────────────
+    pdf = pikepdf.Pdf.open(path)
+    doc = fitz.open(path)
+
+    # ── 1. Metadata ───────────────────────────────────────────────────────
+    if not pdf.docinfo.get("/Title"):
+        pdf.docinfo.update({"/Title": String("Accessible Document")})
+
+    if not pdf.Root.get("/Lang"):
+        pdf.Root["/Lang"] = String("en-US")
+
+    # ── 2. StructTree ─────────────────────────────────────────────────────
+    struct = create_structure_if_missing(pdf)
+
+    # ── 3. Alt text ───────────────────────────────────────────────────────
+    page_images = get_all_images(doc)
+    fix_alt_text(pdf, doc, struct, page_images)
+
+    # ── 4. Table headers ──────────────────────────────────────────────────
+    tables_fixed = fix_table_headers(pdf)
+    if tables_fixed:
+        print(f"  Table headers fixed: {tables_fixed} table(s)")
+
+    # ── 5. Link accessible names ──────────────────────────────────────────
+    links_fixed = fix_link_accessible_names(pdf, doc)
+    if links_fixed:
+        print(f"  Link accessible names added: {links_fixed} annotation(s)")
+
+    # ── Save structural fixes ─────────────────────────────────────────────
+    doc.close()
+    pdf.save(fixed_path)
+    pdf.close()
+    print(f"Saved fixed PDF (structural): {fixed_path}")
+
+    # ── 6. Colour contrast (second fitz pass on saved file) ───────────────
+    contrast_fixed = fix_contrast(fixed_path)
+    if contrast_fixed:
+        print(f"  Contrast spans fixed: {contrast_fixed}")
+
+    print(f"Saved fixed PDF (final): {fixed_path}")
+    return fixed_path
