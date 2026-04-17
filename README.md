@@ -20,10 +20,9 @@ Conclusion/Results:
 
 Using the benchmark and alternative scoring method as a base, we developed an automated tool for accessibility diagnosis and scoring of common document types of PDF, PPTX, and DOCX. This was then extended as a framework for fully automated patching of accessibility issues. Our initial prototype indicates that addressing common WCAG 2.2 compatibility issues can be automated with minimal user interaction. ​​
 
-​​
-The program: 
-
 This program is a prototype framework for fully automated patching of accessibility issues for PDF, DOCX, and PPTX documents based on WCAG 2.2 Guidelines. The program was made for the Symposium on Undergraduate Research and Creatuve Activity at Iowa State University. There is a main.py, a checker.py, and 3 fixers and checkers for the different file types. Currently single files or a test suite can be run.
 
-To run the program: 
-1)
+The examples/ directory contains sample files for testing, while the requirements.txt explains all the required libraries to download.
+
+To run all examples --> python main.py --suite examples/
+To run single document --> python main.py examples/document_name.pdf --fix
