@@ -13,8 +13,7 @@ Objectives:
 
 - Generate a benchmark set of files with a range of WCAG 2.2 accessibility issues and corresponding scores.
 - Develop an alternative to the Ally scoring system that can be run outside of Canvas for differing document types (PDF, Microsoft Office DOCX, Presentation PPTX)
-                                                                                      
--Based on the scoring system developed, make fixes to all WCAG 2.2 accessibility violations (color contrast, alternative text, table headers, language settings, etc.)​
+- Based on the scoring system developed, make fixes to all WCAG 2.2 accessibility violations (color contrast, alternative text, table headers, language settings, etc.)​
 
 
 Conclusion/Results:
