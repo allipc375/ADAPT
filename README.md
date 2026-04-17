@@ -24,5 +24,5 @@ This program is a prototype framework for fully automated patching of accessibil
 
 The examples/ directory contains sample files for testing, while the requirements.txt explains all the required libraries to download.
 
-To run all examples --> python main.py --suite examples/
+To run all examples --> python main.py --suite examples/                                                                         
 To run single document --> python main.py examples/document_name.pdf --fix
