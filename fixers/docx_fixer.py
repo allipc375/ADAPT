@@ -1,5 +1,4 @@
-# docx_fixer.py
-
+# fixers/docx_fixer.py
 
 import io
 import logging
