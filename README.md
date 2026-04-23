@@ -24,5 +24,24 @@ This program is a prototype framework for fully automated patching of accessibil
 
 The examples/ directory contains sample files for testing, while the pyproject.toml explains all the required libraries to download.
 
+| File Name	| Format |	Issue Type (what file lacks) |	Issue Severity |	Count (number of violations) | Score |
+|-----------|-------|--------------------------------|-----------------|-------------------------------|-------|
+| docx_Compliant|	docx |	None| None	|	0	| 100 |
+|docx_altText1	|docx	Alternative text|	Minimal		|1|	76|
+|docx_altText2|	docx|	Alternative text	|Intermediate	|	2|	53|
+|docx_language|	docx|	Language set|	Minimal	|	1	|95|
+|docx_heading|	docx|	Proper heading|	Minimal	|	1|	99|
+|docx_table|	docx|	Tables with headers|	Minimal	|	1	|68|
+|docx_list |	docx|	List format	|None	|	1	|100|
+|docx_link	|docx|	Links have text to describe target|	None|		1	|100|
+|docx_colorContrast	|docx|	Color contrast	|Severe	|	22	|5|
+|docx_linkMore	|docx|	Links have text to describe target|	None	|	5	|100|
+|docx_altTextMore|	docx	|Alternative text	|Intermediate|		5|	53|
+|docx_tableMore|	docx|	Tables with headers	|Minimal	|	5|	68|
+|docx_altText_heading |	docx	|Alternative text + Heading	|Minimal	|	2|	76|
+|docx_table_contrast	|docx	|Tables with headers + Color contrast	|Minimal	|	2|	67|
+|docx_decorativeImage	|docx|	Decorative Image	|Minimal	|	1	|76|
+|docx_decorativeImage2	|docx|	Decorative Image|	Intermediate	|	2|	53|
+
 ### To run all examples --> python main.py --suite tests/                                                                         
 ### To run single document --> python main.py tests/document_name.pdf --fix
