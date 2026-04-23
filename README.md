@@ -22,7 +22,7 @@ Using the benchmark and alternative scoring method as a base, we developed an au
 
 This program is a prototype framework for fully automated patching of accessibility issues for PDF, DOCX, and PPTX documents based on WCAG 2.2 Guidelines. The program was made for the Symposium on Undergraduate Research and Creatuve Activity at Iowa State University. There is a main.py, a checker.py, and 3 fixers and checkers for the different file types. Currently single files or a test suite can be run.
 
-The examples/ directory contains sample files for testing, while the requirements.txt explains all the required libraries to download.
+The examples/ directory contains sample files for testing, while the pyproject.toml explains all the required libraries to download.
 
 ### To run all examples --> python main.py --suite tests/                                                                         
 ### To run single document --> python main.py tests/document_name.pdf --fix
