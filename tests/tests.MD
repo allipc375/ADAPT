@@ -17,6 +17,10 @@
 | pdf_test005 | Tables |
 | pdf_test006 | Tables + Color contrast |
 | pdf_test007 | Tagging |
+| pdf_test008 | Alternative text |
+| pdf_test009 | Alternative text |
+| pdf_test010 | Alternative text |
+| pdf_test011 | Color contrast |
 | pptx_test001 | None |
 | pptx_test002 | Alternative text |
 | pptx_test003 | Alternative text |
