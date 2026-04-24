@@ -45,8 +45,8 @@ The tests/ directory contains sample files for testing, while the pyproject.toml
 |pdf_test007|	pdf	|Tagging pdf	|Severe	|1|	7		|
 |pdf_test008	|pdf|	Alternative text|	Minimal	|1	|77	|																			
 |pdf_test009|	pdf	|Alternative text|	Intermediate	|2	|54		|
-|pdf_010|	pdf|	Alternative text	|Intermediate	|5	|54	|
-|pdf_011|	pdf	|Color contrast|	Severe	|22	|5	|
+|pdf_test010|	pdf|	Alternative text	|Intermediate	|5	|54	|
+|pdf_test011|	pdf	|Color contrast|	Severe	|22	|5	|
 |pptx_test001|	pptx	|None|	None|	0	|100	|
 |pptx_test002|	pptx	|Alternative text	|Minimal	|1	|84	|																			
 |pptx_test003	|pptx|	Alternative text|	Intermediate	|2	|53		|
